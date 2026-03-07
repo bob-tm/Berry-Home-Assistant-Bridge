@@ -6,7 +6,7 @@ The current version implements a Virtual Light Driver. It supports more than fiv
 0. Create Virtual Light on top of Tasmota Console commands PWM1, PWM2, etc
 1. Automatic integration into Home Assistant under the correct Tasmota device
 2. Full support for PWM dimming and ON/OFF. Remembers the last PWM (brightness) value when turned OFF and then back ON
-3. Full integration with the Tasmota web UI — sliders with real-time updates
+3. Full integration with the Tasmota web UI — sliders with real-time updates and toggle button
 4. Individual PWM channels can be limited to ON/OFF mode (acting as simple switches) if you decide not to use brightness for some channels in the future. Or use some PWM channels with relays (PCA9865)
 5. New console commands in Tasmota: light1, light2, …
 6. Provides native light entities in Home Assistant
@@ -37,11 +37,14 @@ ha_bridge.LightTasmotaPwm(6, 'LightPwm 6')
 
 Full Example for lights on PWM1, PWM2 (ON/OFF) and PWM6
 ```
-import ha_bridge
+import ha_bridge as ha
 
-var bridge = ha_bridge.HaBridge()
-bridge.add(     ha_bridge.LightTasmotaPwm(1, 'LightPwm 1' ))
-bridge.add(ha_bridge.LightTasmotaPwmOnOff(2, 'LightOnOff 2'))
-bridge.add(     ha_bridge.LightTasmotaPwm(6, 'LightPwm 6'))
+var bridge = ha.HaBridge()
+bridge.add(ha.LightTasmotaPwm(1, 'LightPwm 1'))
+bridge.add(ha.LightTsmtaOnOff(2, 'PwmOnOff 2'))
+bridge.add(ha.LightTsmtaOnOff(3, 'PwmOnOff 3'))
+bridge.add(ha.LightTasmotaPwm(4, 'LightPwm 4'))
+bridge.add(ha.LightTasmotaPwm(5, 'LightPwm 5'))
+bridge.add(ha.LightTasmotaPwm(6, 'LightPwm 6'))
 bridge.finish_and_publish()
 ```
