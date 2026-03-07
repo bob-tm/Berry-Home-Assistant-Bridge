@@ -523,7 +523,7 @@ end
 var m=module('ha_bridge')
 m.HaBridge=HaBridge
 m.LightTasmotaPwm=LightTasmotaPwm
-m.LightTasmotaPwmOnOff=LightTasmotaPwmOnOff
+m.LightTsmtaOnOff=LightTasmotaPwmOnOff
 
 return m
 #demo()
