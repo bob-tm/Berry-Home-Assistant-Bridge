@@ -1,3 +1,4 @@
+# Version 0.2
 import mqtt
 import json
 import string
@@ -9,10 +10,47 @@ def json_add(dest, src)
 	end
 end
 
+def get_tasmota_prefix()
+	var p = tasmota.cmd('_Prefix')
+	return {
+		'cmnd': p['Prefix1'],
+		'stat': p['Prefix2'],
+		'tele': p['Prefix3']
+	}
+end
 
+def get_ha_mac_id()
+	var mac = false
+	var wifi_info = tasmota.wifi()
+		
+	if wifi_info  mac = wifi_info.find('mac', false) end 
+	if mac==false
+		var eth_info  = tasmota.eth()
+		if eth_info mac = eth_info.find('mac', false) end 
+	end
+	
+	if mac 
+		#print(f"MAC is {mac}")
+		var mac_clean = string.replace(mac, ":", "")
+		return mac_clean[-12..-1]
+	else
+		return false
+	end
+end
+
+var tasmota_ha_mac_id = get_ha_mac_id()
+var tasmota_topic     = tasmota.cmd('_Status')['Status']['Topic']
+var tasmota_prefix 	  = get_tasmota_prefix()
+var tasmota_fulltopic = string.replace(tasmota.cmd('_FullTopic')['FullTopic'], '%topic%', tasmota_topic)
+
+def get_full_topic(prefix, cmd) return string.replace(tasmota_fulltopic, '%prefix%', tasmota_prefix[prefix])+cmd end
+def get_data_topic() return get_full_topic('stat', 'DATA') end
+def get_result_topic() return get_full_topic('stat', 'RESULT') end
+
+	
+	
 # Basic Entity Integration
 class HaEntity
-	var parent			# parent class
 	var cmd 			# LIGHT1, LIGHT2, ...
 	var cmd_idx			# 1, 2, 3 ...
 	var params			# Json with config
@@ -23,13 +61,13 @@ class HaEntity
 	def init_params() 						end		# supported features
 	def getConfig() return {} 				end		# json for HA Discovery
 
-	def telePeriodJson() return false		end		# will be added to Tasmota TelePeriod JSON
+	def stateJson() return false		    end		# will be added to Tasmota TelePeriod JSON
 	def handle_rule(payload)				end		# triggered by Tasmota Rules
 	def handle_stat(payload) return false 	end 	# hack to convert mqtt stat to tele
 	def handle_cmd(payload, src) 			end 	# handle action
 	
 	# unique topic
-	def getTopic() 	return f"{self.parent.mac_suffix}_{self.cmd}" end
+	def getTopic() 	return f"{tasmota_ha_mac_id}_{self.cmd}" end
 	
 	def init(cmd_idx, title)
 		self.title	 = title
@@ -39,16 +77,21 @@ class HaEntity
 		self.init_params()
 		self.cmd     = self.params['cmd']
 	end
+	
+	def publish_state()	
+		mqtt.publish(get_data_topic(), json.dump(self.stateJson()) ) 
+	end
 end
 
 # Basic Pwm Light
 class LightPwm: HaEntity
-	var state, pwm
+	var state, pwm, pwm_user
 	
 	def init_params()
-		self.pwm    = 0
-		self.state  = "OFF" 
-		self.params = {
+		self.pwm      = 0
+		self.state    = "OFF"
+		self.pwm_user = 0		
+		self.params   = {
 			'type'   : 'light',						# HA Class
 			'cmd'    : f"LIGHT{self.cmd_idx}",		# Topic
 			'max_pwm': 255,							# Max PWM Value
@@ -57,10 +100,12 @@ class LightPwm: HaEntity
 	end
 	
 	def getConfig()
-		var tasmota_topic = self.parent.tasmota_topic
+		var cmnd_topic = get_full_topic('cmnd', self.cmd)
+		var data_topic = get_data_topic()
+		
 		var config = {
-		  "command_topic"				: f"cmnd/{tasmota_topic}/{self.cmd}",
-		  "state_topic"					: f"stat/{tasmota_topic}/DATA",
+		  "command_topic"				: cmnd_topic,
+		  "state_topic"					: data_topic,
 		  "state_value_template"		: "{{value_json."+self.cmd+"}}",
 		  "payload_on"					: "ON",
 		  "payload_off"					: "OFF"
@@ -69,8 +114,8 @@ class LightPwm: HaEntity
 		if self.params['pwm']
 			json_add(config,
 			{
-			  "brightness_command_topic"	: f"cmnd/{tasmota_topic}/{self.cmd}",
-			  "brightness_state_topic"		: f"stat/{tasmota_topic}/DATA",
+			  "brightness_command_topic"	: cmnd_topic,
+			  "brightness_state_topic"		: data_topic,
 			  "brightness_value_template"	: "{{value_json."+self.cmd+"_PWM}}",
 			  "on_command_type"				: "brightness",
 			  "brightness_scale"			: self.params['max_pwm']
@@ -83,8 +128,14 @@ class LightPwm: HaEntity
 
 	# decode state and pwm from message from HA
 	def decode_payload(payload, debug_text)
-		# self.log(f"decode_payload: {payload} {debug_text}")
-		if payload == 'ON'
+		#self.log(f"decode_payload: {payload} {debug_text}")
+		
+		#web_ui on/off
+		if payload=='t'
+			#self.log('web_ui toggle')
+			self.state = (self.state == 'ON') ? 'OFF' : 'ON'
+			if self.state=='ON' self.pwm = self.pwm_user end
+		elif payload == 'ON'
 			self.state = 'ON'
 		elif payload == 'OFF'
 			self.state = 'OFF'
@@ -140,7 +191,7 @@ class LightTasmotaPwm: LightPwm
 	def do_cmd()
 		var pwm = self.calc_effective_pwm()
 		var res = tasmota.cmd(f"PWM{self.cmd_idx} {pwm}")
-		#self.log(res)
+		self.publish_state()
 		return true
 	end
 	
@@ -163,10 +214,15 @@ class LightTasmotaPwm: LightPwm
 					self.do_cmd()
 				end
 			end
-		end
+			
+			# save non zero pwm for on/off
+			if self.pwm !=0  
+				self.pwm_user=self.pwm 
+			end
+ 		end
 	end
 	
-	def telePeriodJson()
+	def stateJson()
 		return {
 			f"{self.cmd}"	   : self.state, 
 			f"{self.cmd}_PWM"  : self.pwm
@@ -176,7 +232,7 @@ class LightTasmotaPwm: LightPwm
 	#generate modified message
 	def handle_stat(payload)
 		if payload.contains("PWM") && payload["PWM"].contains(f"PWM{self.cmd_idx}")
-			return self.telePeriodJson()
+			return self.stateJson()
 		end
 		return false
 	end
@@ -217,12 +273,18 @@ class UI
     return self
   end
   
-  def web_send_slider_update(id, value)
-	return f"<img src='data:x,' style='display:none' onerror=\"let obj=eb('{id}');if (obj) obj.{value=};this.remove();\">"
+  def btn_style(state) return (state == 'ON') ?  '--c_btn' : '--c_btnoff' end
+  
+  def web_send_slider_update(id, value, state)
+	var slider_update_code=f"let obj=eb('{id}');if (obj) obj.{value=}"
+	var button_update_code=f"eb('b_{id}').style.background='var({self.btn_style(state)})'"
+	return f"<img src='data:x,' style='display:none' onerror=\"{slider_update_code};{button_update_code};this.remove();\">"
   end
 
-  def content_send_slider(id, title, min, max, value)
-	return f'<tr><td style="width:25%">{title}</td><td><input type="range" class="slider" id="{id}" min={min} max={max} value={value} onchange=la("&{id}="+value)></td></tr>'
+  def content_send_slider(id, title, min, max, value, state)
+	var btn_html  = f'<button id="b_{id}" onclick=la("&{id}=t") style="background: var({self.btn_style(state)});" name="b_{id}">{title}</button>'
+	
+	return f'<tr><td style="width:25%">{btn_html}</td><td><input type="range" class="slider" id="{id}" min={min} max={max} value={value} onchange=la("&{id}="+value)></td></tr>'
   end
   
   def web_sensor()
@@ -231,8 +293,7 @@ class UI
 	# check for ui input commands
 	for k : self.bridge.entities.keys()
 		if webserver.has_arg(k)
-			var x=int(webserver.arg(k))
-			self.bridge.entities[k].handle_cmd(x, 'web_ui')
+			self.bridge.entities[k].handle_cmd(webserver.arg(k), 'web_ui')
 		end
 	end
 	
@@ -244,7 +305,7 @@ class UI
 		# sometimes it doesn't work from first time.
 		if tasmota.millis() - e.update_web_ui < 5000
 			# e.log(f"update_web_ui, {k} {e.pwm}")
-			tasmota.web_send(self.web_send_slider_update(k, e.pwm))
+			tasmota.web_send(self.web_send_slider_update(k, e.pwm, e.state))
 		end
 	end
   end
@@ -254,7 +315,7 @@ class UI
 	webserver.content_send('<table style="width:100%">')
 	
 	for e : self.bridge.entities
-		webserver.content_send(self.content_send_slider(string.tolower(e.cmd), e.title, 0, e.params['max_pwm'], e.pwm))
+		webserver.content_send(self.content_send_slider(string.tolower(e.cmd), e.title, 0, e.params['max_pwm'], e.pwm, e.state))
 	end
 
 	webserver.content_send('</table>')
@@ -264,44 +325,12 @@ end
 
 # this class handle unique id, discovery and events
 class HaBridge
-	var mac_addr, mac_suffix, tasmota_topic 
 	var discovery_published		# true, if mqtt connected and discovery published
 	var ready_to_publish		#
 	var entities				# List of controls
 	var ui						# UI sliders
 	
 	def log(s) print(f"{s}") end
-	
-	# Apply device mac addr in different formats
-	def get_mac_suffix()
-		var mac = "VIRTUAL0000000000"
-		var ip  = "0.0.0.0"
-
-		var wifi_info = tasmota.wifi()
-		if wifi_info
-			mac = wifi_info.find('mac', mac)
-			ip  = wifi_info.find('ip', ip)
-		end
-
-		var eth_info = tasmota.eth()
-		if eth_info && (mac == "VIRTUAL0000000000" || ip == "0.0.0.0")
-			mac = eth_info.find('mac', mac)
-			ip  = eth_info.find('ip', ip)
-		end
-		
-		if ip == "0.0.0.0"
-			return false
-		else 
-			var mac_clean = string.replace(mac, ":", "")
-			self.mac_addr = mac
-			self.tasmota_topic = f"tasmota_{mac_clean[-6..-1]}"  # tasmota_E89308
-			self.mac_suffix = mac_clean[-12..-1]
-			return true
-		end
-		
-		return false
-	end
-	
 	
 	def finish_and_publish_on_mqtt_connected()
 		# init is finished
@@ -310,11 +339,9 @@ class HaBridge
 		end
 	end
 	
-	
 	def init()
 		self.discovery_published = false
 		self.ready_to_publish	 = false
-		self.mac_suffix          = false
 		self.entities            = {}
 		
 		# executed at boot
@@ -328,11 +355,12 @@ class HaBridge
 		var s=json.dump(res)
 		
 		if s != "{}"
-			mqtt.publish(f"stat/{self.tasmota_topic}/DATA", s)
+			mqtt.publish(get_data_topic(), s)
 		end
 	end
 
-	# convert mqtt stat to tele 
+	# convert mqtt stat to tele
+	# currently disabled
 	def handle_stat(payload)
 		var tele_results={}
 		var j = json.load(payload)
@@ -358,12 +386,15 @@ class HaBridge
 		
 		# check if mqtt is connected. Publish only once
 		if !self.discovery_published && mqtt.connected()
-			if self.get_mac_suffix()
+			if tasmota_ha_mac_id
 				self.publish_discovery()
 				self.discovery_published = true
 			
-				mqtt.subscribe(f"stat/{self.tasmota_topic}/RESULT", / topic, idx, payload -> self.handle_stat(payload))					
+				#handle_stat is disabled
+				#mqtt.subscribe(get_result_topic(), / topic, idx, payload -> self.handle_stat(payload))					
 				#for e : self.entities e.subscribe() end	
+			else
+				print('Error parsing MAC address')
 			end
 		end 
 	end
@@ -383,12 +414,12 @@ class HaBridge
 			var device_config = {
 				"name"					: e.title,
 				"unique_id"				: f"{entity_topic}",
-				"availability_topic"	: f"tele/{self.tasmota_topic}/LWT",
+				"availability_topic"	: get_full_topic('tele', 'LWT'),
 				"payload_available"		: "Online",
 				"payload_not_available"	: "Offline",			
 				"device"				: {
 											"identifiers":  [entity_topic],  
-											"connections":  [["mac", self.mac_suffix]]    
+											"connections":  [["mac", tasmota_ha_mac_id]]    
 											#"name":         "Virtual Name",
 											#"model":        "ESP32C3",
 											#"manufacturer": "Tasmota",
@@ -428,7 +459,6 @@ class HaBridge
 	end
 	
 	def add(e)
-		e.parent = self
 		# check for alredy registered tasmota command
 		var cmd_found = false
 		for k:self.entities.keys()
@@ -459,7 +489,7 @@ class HaBridge
 	def do_teledata_cmd()
 		var tele_results={}
 		for e : self.entities
-			json_add(tele_results, e.telePeriodJson()) 
+			json_add(tele_results, e.stateJson()) 
 		end
 		
 		#print(f"TeleData {tele_results}")
@@ -482,9 +512,18 @@ class HaBridge
 	end	
 end
 
+def demo()
+	var bridge = HaBridge()
+	bridge.add(     LightTasmotaPwm(1, 'LightPwm 1' ))
+	bridge.add(LightTasmotaPwmOnOff(2, 'LightOnOff 2'))
+	bridge.add(     LightTasmotaPwm(6, 'LightPwm 6'))
+	bridge.finish_and_publish()
+end
+
 var m=module('ha_bridge')
 m.HaBridge=HaBridge
 m.LightTasmotaPwm=LightTasmotaPwm
 m.LightTasmotaPwmOnOff=LightTasmotaPwmOnOff
 
 return m
+#demo()
