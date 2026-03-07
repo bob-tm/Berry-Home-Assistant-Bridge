@@ -35,7 +35,7 @@ Create Virtual Light for PWM6 with 'LightPwm 6' title
 ha_bridge.LightTasmotaPwm(6, 'LightPwm 6')
 ```
 
-Full Example for lights on PWM1, PWM2 (ON/OFF) and PWM6
+Full Example for 6 PWM lights. 2 and 3 is limited to ON/OFF
 ```
 import ha_bridge as ha
 
