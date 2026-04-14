@@ -1,8 +1,10 @@
-# Version 0.2
+# Version 0.5
 import mqtt
 import json
 import string
 
+var step_up_down = 9 
+var print_log    = false
 
 def json_add(dest, src)
 	for key : src.keys()
@@ -38,6 +40,10 @@ def get_ha_mac_id()
 	end
 end
 
+def enable_log(en)
+	print_log=en
+end
+
 var tasmota_ha_mac_id = get_ha_mac_id()
 var tasmota_topic     = tasmota.cmd('_Status')['Status']['Topic']
 var tasmota_prefix 	  = get_tasmota_prefix()
@@ -53,11 +59,12 @@ def get_result_topic() return get_full_topic('stat', 'RESULT') end
 class HaEntity
 	var cmd 			# LIGHT1, LIGHT2, ...
 	var cmd_idx			# 1, 2, 3 ...
+	var pin_id			# cmd_idx not always == pin_id				
 	var params			# Json with config
 	var title			# User Friednly Title
 	var update_web_ui	# Last Update Time in ms
 	
-	def log(s) print(self.cmd, s) 			end
+	def log(s) if print_log print(self.cmd, s); end; end
 	def init_params() 						end		# supported features
 	def getConfig() return {} 				end		# json for HA Discovery
 
@@ -69,9 +76,18 @@ class HaEntity
 	# unique topic
 	def getTopic() 	return f"{tasmota_ha_mac_id}_{self.cmd}" end
 	
-	def init(cmd_idx, title)
-		self.title	 = title
-		self.cmd_idx = cmd_idx
+	def init(pin_id, p2, p3)
+		var title   = p2
+		var cmd_idx = nil
+		
+		if p3!=nil 
+			title   = p3
+			cmd_idx = p2
+		end
+		
+		self.title	= title
+		self.pin_id  = pin_id
+		self.cmd_idx = cmd_idx==nil ? pin_id:cmd_idx
 		self.update_web_ui = 0
 		
 		self.init_params()
@@ -85,19 +101,31 @@ end
 
 # Basic Pwm Light
 class LightPwm: HaEntity
-	var state, pwm, pwm_user
+	var state, pwm, pwm_switch_on	#ON/OFF, PWM, PWM after ON
+	var cmd_setpwm, rule_json_key
 	
 	def init_params()
-		self.pwm      = 0
-		self.state    = "OFF"
-		self.pwm_user = 0		
+		self.pwm      		= 0
+		self.state    		= "OFF"
+		self.pwm_switch_on  = 0		
 		self.params   = {
 			'type'   : 'light',						# HA Class
 			'cmd'    : f"LIGHT{self.cmd_idx}",		# Topic
 			'max_pwm': 255,							# Max PWM Value
-			'pwm'    : true							# On / Off (max_pwm or 0) if pwm = false 
+			'pwm'    : true							# On / Off (max_pwm or 0) if pwm = false
 		}
 	end
+
+	
+	# force pwm to max_pwm, if pwm in range clamp_percent..99%
+	# this is lowers mossfet temperature with bad gate drivers. 
+	def clamp(clamp_percent)
+		self.params['clamp_pwm'] = int(self.params['max_pwm'] * clamp_percent / 100)
+		return self
+	end
+	
+	def pwm_percent() return int(self.pwm*100/self.params['max_pwm']) end
+	def on_off_mode() return !self.params['pwm'] end
 	
 	def getConfig()
 		var cmnd_topic = get_full_topic('cmnd', self.cmd)
@@ -110,6 +138,11 @@ class LightPwm: HaEntity
 		  "payload_on"					: "ON",
 		  "payload_off"					: "OFF"
 		}
+		
+		if self.params['type'] == 'switch'
+			config["value_template"] = config["state_value_template"]
+			config.remove("state_value_template")
+		end
 		
 		if self.params['pwm']
 			json_add(config,
@@ -125,58 +158,133 @@ class LightPwm: HaEntity
 		return config
 	end
 	
+	def calc_pwm(x)
+		#self.log(f"calc_pwm: {x}")	
+		# on/off mode
+		if self.on_off_mode()
+			var p=x>0 ? self.params['max_pwm'] : 0
+			if p!=x; self.log(f"fix PWM  from {x} to {p}") end
+			return p
+		end
+		
+		# clamp_pwm
+		if self.params.contains('clamp_pwm')
+			if (x>self.params['clamp_pwm']) && (x<self.params['max_pwm']) 
+				self.log(f"Clamp PWM from {x} to {self.params['max_pwm']}")
+				return self.params['max_pwm']
+			end
+		end
+		
+		return x
+	end
 
 	# decode state and pwm from message from HA
-	def decode_payload(payload, debug_text)
-		#self.log(f"decode_payload: {payload} {debug_text}")
+	def decode_payload(payload, debug_text)		
+		#self.log(f"decode_payload: {payload} {debug_text}")	
+
+		if self.pwm_switch_on==0; self.pwm_switch_on=self.params['max_pwm'] end
 		
-		#web_ui on/off
-		if payload=='t'
-			#self.log('web_ui toggle')
+		# important force to string. string.toupper makes payload=nil if payload is int
+		payload = string.toupper(str(payload))
+		#toggle (webui or cmd)
+		if payload=='+' || payload=='UP'
+			if self.state=='OFF' 
+				self.pwm   = 0
+				self.state ='ON' 
+			end
+
+			self.pwm = self.pwm + self.params['max_pwm']/step_up_down
+				
+			if self.pwm > self.params['max_pwm'] 
+				self.pwm = self.params['max_pwm']
+			end
+		elif payload=='-' || payload=='DOWN'
+			if self.state=='ON' 
+				self.pwm = self.pwm - self.params['max_pwm']/step_up_down
+				if self.pwm <= 0 
+					self.pwm   = 0
+					self.state ='OFF' 
+				end
+			end
+		elif payload=='T' || payload=='TOGGLE'
 			self.state = (self.state == 'ON') ? 'OFF' : 'ON'
-			if self.state=='ON' self.pwm = self.pwm_user end
+			self.pwm   = (self.state == 'ON') ? self.pwm_switch_on : 0
 		elif payload == 'ON'
 			self.state = 'ON'
+			self.pwm   = self.pwm_switch_on
 		elif payload == 'OFF'
 			self.state = 'OFF'
+			self.pwm   = 0
 		else
-			self.pwm = int(payload)
+			self.pwm      = self.calc_pwm(int(payload))
+			
+			# save last on value
+			if self.pwm>0; self.pwm_switch_on = self.pwm end
+			
 			if self.pwm>0
 				self.state = 'ON'
 			else
 				self.state = 'OFF'
 			end
 		end
-	end
 		
-	def calc_effective_pwm()
-		if !self.params['pwm']
-			if self.state == 'ON'
-				self.pwm = self.params['max_pwm']
-			else
-				self.state = 'OFF'
-				self.pwm = 0
-			end
-		end
-		
-		if self.state == 'OFF'
-			return 0
-		elif self.pwm <= self.params['max_pwm']
-			return self.pwm
-		else
-			return 0
-		end
-	end
-	
-	def handle_cmd(payload, src)	
-		#self.log(f"handle_cmd: {payload} from {src}")
-		self.decode_payload(payload, 'cmd')
-		self.do_cmd()		
 		self.update_web_ui = tasmota.millis()
 	end
+		
+	def handle_cmd(payload, src)	
+		if payload!=''
+			#self.log(f"handle_cmd: {payload} from {src}")
+			self.decode_payload(payload, src)
+			self.do_cmd(self.pwm)		
+			self.update_web_ui = tasmota.millis()
+		else
+			#self.log(f"handle_cmd: Empty payload from {src}")
+			self.publish_state()
+			return self.stateJson()
+		end
+	end
 	
-	# for override 
-	def do_cmd()	return true end
+	
+	# triggered by rules  
+	def handle_rule(payload)
+		if payload.contains(self.rule_json_key) && payload[self.rule_json_key].contains(f"PWM{self.pin_id}")
+			var x = int(payload[self.rule_json_key][f"PWM{self.pin_id}"])	# current hardware value
+			#self.log(f"Handle_rule: {self.pwm} -> {x}")
+	
+			if x != self.pwm 
+				var prev_pwm = self.pwm
+				self.decode_payload(x, 'rule')
+				self.log(f"Update self.pwm: {prev_pwm} -> {self.pwm}")
+				if (x != self.pwm) # && init_done
+					self.log(f"Update real pwm: {x} -> {self.pwm}")
+					self.do_cmd(self.pwm)
+				end
+			end
+ 		end
+	end
+	
+	#generate modified message
+	def handle_stat(payload)
+		if payload.contains(self.rule_json_key) && payload[self.rule_json_key].contains(f"PWM{self.pin_id}")
+			return self.stateJson()
+		end
+		return false
+	end
+
+	def stateJson()
+		return {
+			f"{self.cmd}"	   : self.state, 
+			f"{self.cmd}_PWM"  : self.pwm
+		}
+	end
+
+	def do_cmd(pwm)
+		var cmd=string.format(self.cmd_setpwm, pwm)
+		self.log(f"do_cmd: {cmd}; self.pwm={self.pwm}; self.pwm_switch_on={self.pwm_switch_on}; self.state={self.state}")
+		var res = tasmota.cmd(cmd)
+		self.publish_state()
+		return true
+	end
 end
 
 
@@ -185,56 +293,10 @@ end
 class LightTasmotaPwm: LightPwm
 	def init_params()
 		super(self).init_params()
-		self.params['max_pwm']=1023
-	end
-	
-	def do_cmd()
-		var pwm = self.calc_effective_pwm()
-		var res = tasmota.cmd(f"PWM{self.cmd_idx} {pwm}")
-		self.publish_state()
-		return true
-	end
-	
-	# triggered by rules
-	def handle_rule(payload)
-		if payload.contains("PWM") && payload["PWM"].contains(f"PWM{self.cmd_idx}")
-			var x = int(payload["PWM"][f"PWM{self.cmd_idx}"])
-			#print(f"handle_rule {self.pwm} -> {x}")
-			if x != self.pwm 	
-				#self.log(f"Handle_rule: {self.pwm} -> {x}")
-				self.pwm = x				
-				self.state = self.pwm > 0 ? 'ON' : 'OFF'
-				self.update_web_ui = tasmota.millis()
-				#self.log("update_web_ui = true 2")
-				
-				# fix PWM for ON/OFF mode
-				if !self.params['pwm'] && (x > 0) && (x != self.params['max_pwm']) 
-					self.log(f"fix PWM  from {x} to {self.params['max_pwm']}")
-					self.pwm = self.params['max_pwm'] 
-					self.do_cmd()
-				end
-			end
-			
-			# save non zero pwm for on/off
-			if self.pwm !=0  
-				self.pwm_user=self.pwm 
-			end
- 		end
-	end
-	
-	def stateJson()
-		return {
-			f"{self.cmd}"	   : self.state, 
-			f"{self.cmd}_PWM"  : self.pwm
-		}
-	end
-	
-	#generate modified message
-	def handle_stat(payload)
-		if payload.contains("PWM") && payload["PWM"].contains(f"PWM{self.cmd_idx}")
-			return self.stateJson()
-		end
-		return false
+		self.params['max_pwm']	= 1023
+		self.cmd_setpwm			= f"PWM{self.pin_id} %s"
+		self.rule_json_key		= "PWM"
+		self.params['rule']     = {'class_inst': LightTasmotaPwm, 'status_cmd': 'pwm'}
 	end
 end
 
@@ -245,16 +307,55 @@ class LightTasmotaPwmOnOff: LightTasmotaPwm
 	end
 end
 
+class LightPCA9685Pwm: LightPwm
+	def init_params()
+		super(self).init_params()
+		self.params['max_pwm']	= 4096
+		self.cmd_setpwm			= f"driver15 pwm,{self.pin_id},%s"
+		self.rule_json_key		= "PCA9685"
+		self.params['rule']     = {'class_inst': LightPCA9685Pwm, 'status_cmd': 'driver15 status'}
+	end
+	
+	def handle_rule(payload)
+		if payload.contains(self.rule_json_key) && payload[self.rule_json_key].contains(f"PIN")
+			if payload[self.rule_json_key]['PIN']==self.pin_id
+				payload[self.rule_json_key][f"PWM{self.pin_id}"]=payload[self.rule_json_key]['PWM']
+				#print(self.pin_id, payload)
+				super(self).handle_rule(payload)
+			end
+		else
+			super(self).handle_rule(payload)
+		end
+	end
+end
+
+class LightPCA9685OnOff: LightPCA9685Pwm
+	def init_params()
+		super(self).init_params()
+		self.params['pwm']=false
+	end
+end
+
+class SwitchPCA9685OnOff: LightPCA9685Pwm
+	def init_params()
+		super(self).init_params()
+		self.params['type']='switch'
+		self.params['cmd' ]=f"SWITCH{self.cmd_idx}"
+		self.params['pwm' ]=false
+	end
+end
+
 
 # this is tasmota driver
 # used to display sliders
 class UI
-  var id, globalname, started, bridge
+  var id, globalname, started, bridge, slider_for_onoff
 
   def init(bridge)
     self.id = "ha_bridge_ui"
     self.globalname = 'slider_instance_' + self.id
 	self.bridge = bridge
+	self.slider_for_onoff = false
   end
 
   def start()
@@ -275,50 +376,59 @@ class UI
   
   def btn_style(state) return (state == 'ON') ?  '--c_btn' : '--c_btnoff' end
   
-  def web_send_slider_update(id, value, state)
+  def web_send_slider_update(id, value, state, pwm_percent, on_off_mode)
 	var slider_update_code=f"let obj=eb('{id}');if (obj) obj.{value=}"
 	var button_update_code=f"eb('b_{id}').style.background='var({self.btn_style(state)})'"
-	return f"<img src='data:x,' style='display:none' onerror=\"{slider_update_code};{button_update_code};this.remove();\">"
+	var text_update_code=f"eb('t_{id}').innerHTML={pwm_percent}"
+	
+	slider_update_code = on_off_mode ? '' : slider_update_code
+	
+	return f"<img src='data:x,' style='display:none' onerror=\"{slider_update_code};{button_update_code};{text_update_code};this.remove();\">"
   end
 
-  def content_send_slider(id, title, min, max, value, state)
+  def content_send_slider(id, title, min, max, value, state, pwm_percent, on_off_mode)
 	var btn_html  = f'<button id="b_{id}" onclick=la("&{id}=t") style="background: var({self.btn_style(state)});" name="b_{id}">{title}</button>'
+	var span_html = f'<span id="t_{id}">{pwm_percent}</span>'
+	var slider_html = f'<input type="range" class="slider" id="{id}" min={min} max={max} value={value} onchange=la("&{id}="+value)>'
 	
-	return f'<tr><td style="width:25%">{btn_html}</td><td><input type="range" class="slider" id="{id}" min={min} max={max} value={value} onchange=la("&{id}="+value)></td></tr>'
+	slider_html = on_off_mode ? '' : slider_html
+	
+	return f'<tr><td style="width:25%">{btn_html}</td><td>{slider_html}</td><td style="min-width:2em; text-align:right">{span_html}</td></tr>'
   end
   
   def web_sensor()
     import webserver
 
 	# check for ui input commands
-	for k : self.bridge.entities.keys()
+	for e : self.bridge.entities
+		var k=string.tolower(e.cmd)
 		if webserver.has_arg(k)
-			self.bridge.entities[k].handle_cmd(webserver.arg(k), 'web_ui')
+			e.handle_cmd(webserver.arg(k), 'web_ui')
 		end
 	end
 	
 	# update ui
-	for k : self.bridge.entities.keys()
-		var e=self.bridge.entities[k]
-		
+	for e : self.bridge.entities
 		# send update code for 5 seconds. 
 		# sometimes it doesn't work from first time.
 		if tasmota.millis() - e.update_web_ui < 5000
 			# e.log(f"update_web_ui, {k} {e.pwm}")
-			tasmota.web_send(self.web_send_slider_update(k, e.pwm, e.state))
+			tasmota.web_send(self.web_send_slider_update(string.tolower(e.cmd), e.pwm, e.state, e.pwm_percent(), e.on_off_mode()))
 		end
 	end
   end
 
   def web_add_main_button()
     import webserver
-	webserver.content_send('<table style="width:100%">')
+	var html='<table style="width:100%">'
 	
 	for e : self.bridge.entities
-		webserver.content_send(self.content_send_slider(string.tolower(e.cmd), e.title, 0, e.params['max_pwm'], e.pwm, e.state))
+		html = html + self.content_send_slider(string.tolower(e.cmd), e.title, 0, e.params['max_pwm'], e.pwm, e.state, e.pwm_percent(), e.on_off_mode())
 	end
+	
+	html = html + '</table>'
 
-	webserver.content_send('</table>')
+	webserver.content_send(html)
   end
 end
 
@@ -329,20 +439,23 @@ class HaBridge
 	var ready_to_publish		#
 	var entities				# List of controls
 	var ui						# UI sliders
+	var rules					# rules for items
 	
 	def log(s) print(f"{s}") end
 	
 	def finish_and_publish_on_mqtt_connected()
 		# init is finished
-		if self.ready_to_publish 
+		if self.ready_to_publish && mqtt.connected()
 			self.finish_and_publish()
 		end
 	end
 	
 	def init()
-		self.discovery_published = false
-		self.ready_to_publish	 = false
-		self.entities            = {}
+		self.discovery_published  = false
+		self.ready_to_publish	  = false
+		self.entities             = []
+		
+		self.rules                = {}
 		
 		# executed at boot
 		tasmota.add_rule("mqtt#connected", 		/-> self.finish_and_publish_on_mqtt_connected())
@@ -350,6 +463,13 @@ class HaBridge
 		self.log('Ha Bridge initialized')
 	end
 
+	def limit(group, by_percent)
+		for e : self.entities
+			if (group.find(e.cmd_idx) != nil) && e.params['pwm']
+				e.handle_cmd(f"{e.pwm - int(e.pwm*by_percent/100)}", 'limiter')
+			end
+		end
+	end
 
 	def publish_result(res)
 		var s=json.dump(res)
@@ -378,11 +498,17 @@ class HaBridge
 	end
 
 	def finish_and_publish()
-		self.add_rule_TasmotaPWM()
-		self.add_rule_TeleData()
-		self.start_ui()
+		# print(f"finish_and_publish. Ready={self.ready_to_publish}")
+		if !self.ready_to_publish
+			for k:self.rules.keys()
+				self.add_rule_PWM(k, self.rules[k]['status_cmd'])
+			end
+					
+			self.add_rule_TeleData()
+			self.start_ui()
 
-		self.ready_to_publish = true
+			self.ready_to_publish = true
+		end
 		
 		# check if mqtt is connected. Publish only once
 		if !self.discovery_published && mqtt.connected()
@@ -442,17 +568,29 @@ class HaBridge
 		self.log('HA discovery published')
 	end
 
-	def do_tasmota_cmd(cmd_indx, payload)
-		self.entities[cmd_indx].handle_cmd(payload, 'tasmota')
+	def do_tasmota_cmd(e, payload)
+		#print('do_tasmota_cmd', payload)
+		return e.handle_cmd(payload, 'tasmota')
 	end
 	
 	def handle_tasmota_cmd(cmd, idx, payload)
-		var cmd_indx = f"{cmd}{idx}"
-		if self.entities.contains(cmd_indx)
-			tasmota.resp_cmnd_done()
-			
-			# using timer, because tasmota.cmd call broke responce
-			tasmota.set_timer(0, / -> self.do_tasmota_cmd(cmd_indx, payload))
+		var cmd_indx = string.tolower(f"{cmd}{idx}")
+		var x = false
+		for e:self.entities
+			if string.tolower(e.cmd) == cmd_indx
+				x=e
+				break
+			end
+		end
+		
+		if x
+			if payload=='' 
+				tasmota.resp_cmnd(self.do_tasmota_cmd(x, payload))
+			else
+				# using timer, because tasmota.cmd call broke responce
+				tasmota.resp_cmnd_done()
+				tasmota.set_timer(0, / -> self.do_tasmota_cmd(x, payload))
+			end
 		else
 			tasmota.resp_cmnd_error()
 		end 
@@ -461,8 +599,8 @@ class HaBridge
 	def add(e)
 		# check for alredy registered tasmota command
 		var cmd_found = false
-		for k:self.entities.keys()
-			if string.startswith(k, e.params['type'])
+		for x:self.entities
+			if string.startswith(string.tolower(x.cmd), e.params['type'])
 				cmd_found = true
 				break
 			end
@@ -475,18 +613,25 @@ class HaBridge
 			tasmota.add_cmd(tsmt_cmd, / cmd, idx, payload -> self.handle_tasmota_cmd(cmd, idx, payload))
 		end
 
-		self.entities[string.tolower(e.cmd)]=e		
+		if !self.rules.contains(e.rule_json_key) self.rules[e.rule_json_key] = e.params['rule'] end
+		
+		self.entities.push(e)
+		
+		print(f"Register {e.cmd} for {e.title}")
 	end
-	
-	def rule_TasmotaPWM(value, trigger, json)
-		for e : self.entities
-			if isinstance(e, LightTasmotaPwm)
-				e.handle_rule(json)
+
+	def rule_PWM(value, trigger, json)
+		if json.contains(trigger)
+			for e : self.entities
+				if isinstance(e, self.rules[trigger]['class_inst'])
+					e.handle_rule(json)
+				end
 			end
-		end	
+		end
 	end
 
 	def do_teledata_cmd()
+		#print("do_teledata_cmd")
 		var tele_results={}
 		for e : self.entities
 			json_add(tele_results, e.stateJson()) 
@@ -496,34 +641,49 @@ class HaBridge
 		self.publish_result(tele_results)
 	end
 	
-	def rule_TeleData()
-		#using timer, because mqtt.publish from rule_TeleData reboots device (v15.2.0.4)
-		tasmota.set_timer(0, / -> self.do_teledata_cmd())
-	end
-	
-	def add_rule_TasmotaPWM()
-		tasmota.add_rule('PWM', / value, trigger, json -> self.rule_TasmotaPWM(value, trigger, json))
-		# execute to get current values
-		tasmota.cmd('PWM1')
+	def rule_TeleData(value, trigger, json)
+		# sometimes 2 tele messages. Check for main
+		# print(f"rule_TeleData {json}")
+		if json.contains('Tele') && json['Tele'].contains('Uptime')
+			#using timer, because mqtt.publish from rule_TeleData reboots device (v15.2.0.4)
+			tasmota.set_timer(0, / -> self.do_teledata_cmd())
+		end
 	end
 
+	def add_rule_PWM(trigger, status_cmd)
+		tasmota.add_rule(trigger, / value, trigger, json -> self.rule_PWM(value, trigger, json))
+		tasmota.cmd(status_cmd)
+	end
+	
 	def add_rule_TeleData()
-		tasmota.add_rule('tele#', /-> self.rule_TeleData())
+		tasmota.add_rule('tele#', / value, trigger, json -> self.rule_TeleData(value, trigger, json))
 	end	
 end
 
 def demo()
 	var bridge = HaBridge()
-	bridge.add(     LightTasmotaPwm(1, 'LightPwm 1' ))
-	bridge.add(LightTasmotaPwmOnOff(2, 'LightOnOff 2'))
-	bridge.add(     LightTasmotaPwm(6, 'LightPwm 6'))
+	#bridge.add(     LightTasmotaPwm(1, 'LightPwm 1' ).clamp(80))
+	#bridge.add(LightTasmotaPwmOnOff(2, 'LightOnOff 2'))
+	#bridge.add(     LightTasmotaPwm(6, 'LightPwm 6'))
+	#bridge.add(     LightTasmotaPwm(6, 'LightPwm 6'))
+	#bridge.add(     LightPCA9685Pwm(8, 'pca9685-8'))
+	#bridge.add(  SwitchPCA9685OnOff(9, 'pca9685-9'))
+	bridge.add(     LightPCA9685Pwm(00, 'pca9685-00'))
+	bridge.add(     LightPCA9685Pwm(01, 'pca9685-01'))
+	bridge.add(     LightPCA9685Pwm(14, 'pca9685-14'))
+	bridge.add(     LightPCA9685Pwm(15, 'pca9685-15'))	
 	bridge.finish_and_publish()
 end
 
 var m=module('ha_bridge')
+m.enable_log=enable_log
 m.HaBridge=HaBridge
+m.get_full_topic=get_full_topic
 m.LightTasmotaPwm=LightTasmotaPwm
 m.LightTsmtaOnOff=LightTasmotaPwmOnOff
+m.LightPCA9685Pwm=LightPCA9685Pwm
+m.Light_9685OnOff=LightPCA9685OnOff
+m.Switch9685OnOff=SwitchPCA9685OnOff
 
 return m
 #demo()
