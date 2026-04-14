@@ -45,9 +45,10 @@ bridge.finish_and_publish()
 ```
 
 
-PCA9685 Example
+PCA9685 Example. I use this extender to control lights and relays. 
 
 This code will create UI in Tasmota and integrate it to HA with Light and Switch enitines.  
+
 
 ```
 var bridge
@@ -77,17 +78,6 @@ def start()
 	bridge.add(ha.Switch9685OnOff(15, 3,  'Relay 3'))
 
 	bridge.finish_and_publish()
-
-	# Buttons and RF Handle
-	sm=switch_matrix.switch_matrix()
-	ir=input_rules.InputRules()
-
-	# Sensors
-	local=sensors.Sensors(ha.get_full_topic('tele', 'SENSOR'))
-	local.add_sensor('Temperature', 'DS18B20')
-	local.add_sensor('INA226-1'   , ['Voltage', 'Current', 'Power'], true)
-	local.register_rules()
-	local.SetLimits(15.0, 60.0)
 end
 
 start()
